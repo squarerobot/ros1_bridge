@@ -41,6 +41,9 @@ struct ServiceBridge2to1
 {
   rclcpp::ServiceBase::SharedPtr server;
   ros::ServiceClient client;
+  // Square Robot: per-service callback group, kept alive here so the executor keeps
+  // spinning this service (the node only holds a weak_ptr to created callback groups).
+  rclcpp::CallbackGroup::SharedPtr callback_group;
 };
 
 class FactoryInterface

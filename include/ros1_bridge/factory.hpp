@@ -476,7 +476,14 @@ public:
     f = std::bind(
       m, this, bridge.client, ros2_node->get_logger(), std::placeholders::_1,
       std::placeholders::_2, std::placeholders::_3);
-    bridge.server = ros2_node->create_service<ROS2_T>(name, f);
+    // Square Robot: give each ROS2->ROS1 service its own MutuallyExclusive callback group
+    // so DIFFERENT services run concurrently on the service MultiThreadedExecutor (they use
+    // distinct ros::ServiceClients), while concurrent calls to the SAME service serialize
+    // (a single ros::ServiceClient is not safe to call() from multiple threads at once).
+    bridge.callback_group =
+      ros2_node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+    bridge.server = ros2_node->create_service<ROS2_T>(
+      name, f, rmw_qos_profile_services_default, bridge.callback_group);
     return bridge;
   }
 
