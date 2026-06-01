@@ -31,6 +31,132 @@
 
 #include "ros1_bridge/factory_interface.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <thread>
+
+// ---------------------------------------------------------------------------
+// Square Robot local patch: per-(direction, topic) relay diagnostics.
+//
+// Purpose: when a topic relays its first sample and then goes permanently silent
+// for the rest of a run (the observed bridge-drop bug), tell WHICH stage dropped
+// it, per topic, per direction:
+//   entered    - the bridge callback fired at all (the sample reached the bridge)
+//   echo_drop  - dropped by echo prevention (ROS2 GID match / ROS1 callerid==/ros_bridge)
+//   nohdr_drop - ROS1 sample dropped because it had no connection header
+//   relayed    - actually forwarded to the other middleware
+//
+// The callbacks only do lock-free atomic increments (negligible perturbation of the
+// single-threaded executor whose budget we are measuring). A single background thread
+// prints a full per-topic summary every 30 wall-seconds, so a topic whose callback has
+// stopped firing is visible explicitly (its counters stop advancing) rather than only
+// by absence of log lines.
+//
+// Reading the summary (grep "BRIDGE-DIAG"):
+//   * a "2to1" topic whose `entered` is frozen      -> mode (a): callback stopped firing
+//                                                       (DDS not delivering OR executor
+//                                                       starvation / lost wakeup)
+//   * `entered` climbing, `relayed` frozen, echo up -> mode (b): echo-prevention filter
+//   * `entered` & `relayed` both climbing here, but
+//     the ROS1 consumer still sees nothing          -> mode (c): downstream of the bridge
+// ---------------------------------------------------------------------------
+namespace ros1_bridge_diag
+{
+struct Counters
+{
+  std::atomic<uint64_t> entered{0};
+  std::atomic<uint64_t> echo_drop{0};
+  std::atomic<uint64_t> nohdr_drop{0};
+  std::atomic<uint64_t> relayed{0};
+};
+
+// Per-(direction, service) forward counters. failed = calls - ok (a failure is a ROS 1
+// client.call() that returned false, or a ROS 2 future that timed out / was unavailable).
+struct SrvCounters
+{
+  std::atomic<uint64_t> calls{0};
+  std::atomic<uint64_t> ok{0};
+};
+
+struct Registry
+{
+  std::mutex mutex;
+  // std::map (not unordered_map): node insertion never invalidates references to
+  // existing elements, so a Counters & handed to a callback stays valid as new
+  // topics register.
+  std::map<std::string, Counters> table;
+  std::map<std::string, SrvCounters> srv_table;
+};
+
+inline Registry & registry()
+{
+  static Registry reg;
+  return reg;
+}
+
+inline void log_summary(const rclcpp::Logger & logger)
+{
+  Registry & reg = registry();
+  std::lock_guard<std::mutex> lock(reg.mutex);
+  for (const auto & entry : reg.table) {
+    const Counters & c = entry.second;
+    RCLCPP_INFO(
+      logger, "[BRIDGE-DIAG] %-44s entered=%-8lu relayed=%-8lu echo=%-8lu nohdr=%lu",
+      entry.first.c_str(),
+      static_cast<unsigned long>(c.entered.load()),
+      static_cast<unsigned long>(c.relayed.load()),
+      static_cast<unsigned long>(c.echo_drop.load()),
+      static_cast<unsigned long>(c.nohdr_drop.load()));
+  }
+  for (const auto & entry : reg.srv_table) {
+    const SrvCounters & s = entry.second;
+    const uint64_t calls = s.calls.load(), ok = s.ok.load();
+    RCLCPP_INFO(
+      logger, "[BRIDGE-DIAG-SRV] %-44s calls=%-6lu ok=%-6lu failed=%lu",
+      entry.first.c_str(), static_cast<unsigned long>(calls),
+      static_cast<unsigned long>(ok), static_cast<unsigned long>(calls - ok));
+  }
+}
+
+// Lazily start one detached reporter thread the first time any bridge registers.
+inline void ensure_reporter_started()
+{
+  static std::once_flag flag;
+  std::call_once(
+    flag, []() {
+      std::thread(
+        []() {
+          auto logger = rclcpp::get_logger("ros1_bridge_diag");
+          // 30 s keeps CI bridge logs manageable while still surfacing a stalled topic
+          // (its counters stop advancing). Lower it when actively debugging a stall.
+          while (rclcpp::ok()) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            log_summary(logger);
+          }
+        }).detach();
+    });
+}
+
+inline Counters & counters_for(const char * direction, const std::string & topic)
+{
+  ensure_reporter_started();
+  Registry & reg = registry();
+  std::lock_guard<std::mutex> lock(reg.mutex);
+  return reg.table[std::string(direction) + " " + topic];
+}
+
+inline SrvCounters & srv_counters_for(const char * direction, const std::string & service)
+{
+  ensure_reporter_started();
+  Registry & reg = registry();
+  std::lock_guard<std::mutex> lock(reg.mutex);
+  return reg.srv_table[std::string(direction) + " " + service];
+}
+}  // namespace ros1_bridge_diag
+
 namespace ros1_bridge
 {
 
@@ -190,9 +316,14 @@ protected:
               ros2_pub->get_topic_name());
     }
 
+    // Square Robot diagnostics: count every sample reaching this callback.
+    auto & diag = ros1_bridge_diag::counters_for("1to2", typed_ros2_pub->get_topic_name());
+    diag.entered.fetch_add(1, std::memory_order_relaxed);
+
     const boost::shared_ptr<ros::M_string> & connection_header =
       ros1_msg_event.getConnectionHeaderPtr();
     if (!connection_header) {
+      diag.nohdr_drop.fetch_add(1, std::memory_order_relaxed);
       RCLCPP_WARN(
         logger, "Dropping ROS 1 message %s without connection header", ros1_type_name.c_str());
       return;
@@ -201,6 +332,7 @@ protected:
     std::string key = "callerid";
     if (connection_header->find(key) != connection_header->end()) {
       if (connection_header->at(key) == "/ros_bridge") {
+        diag.echo_drop.fetch_add(1, std::memory_order_relaxed);
         return;
       }
     }
@@ -213,6 +345,7 @@ protected:
       logger, "Passing message from ROS 1 %s to ROS 2 %s (showing msg only once per type)",
       ros1_type_name.c_str(), ros2_type_name.c_str());
     typed_ros2_pub->publish(std::move(ros2_msg));
+    diag.relayed.fetch_add(1, std::memory_order_relaxed);
   }
 
   static
@@ -225,6 +358,11 @@ protected:
     rclcpp::Logger logger,
     rclcpp::PublisherBase::SharedPtr ros2_pub = nullptr)
   {
+    // Square Robot diagnostics: count every sample reaching this callback. The ROS1
+    // publisher carries the bridged topic name (ros::Publisher::getTopic()).
+    auto & diag = ros1_bridge_diag::counters_for("2to1", ros1_pub.getTopic());
+    diag.entered.fetch_add(1, std::memory_order_relaxed);
+
     if (ros2_pub) {
       bool result = false;
       auto ret = rmw_compare_gids_equal(
@@ -233,6 +371,7 @@ protected:
         &result);
       if (ret == RMW_RET_OK) {
         if (result) {  // message GID equals to bridge's ROS2 publisher GID
+          diag.echo_drop.fetch_add(1, std::memory_order_relaxed);
           return;  // do not publish messages from bridge itself
         }
       } else {
@@ -258,6 +397,7 @@ protected:
       logger, "Passing message from ROS 2 %s to ROS 1 %s (showing msg only once per type)",
       ros2_type_name.c_str(), ros1_type_name.c_str());
     ros1_pub.publish(ros1_msg);
+    diag.relayed.fetch_add(1, std::memory_order_relaxed);
   }
 
 public:
@@ -404,10 +544,13 @@ public:
     ros::ServiceClient client, rclcpp::Logger logger, const std::shared_ptr<rmw_request_id_t>,
     const std::shared_ptr<ROS2Request> request, std::shared_ptr<ROS2Response> response)
   {
+    auto & sdiag = ros1_bridge_diag::srv_counters_for("2to1", client.getService());
+    sdiag.calls.fetch_add(1, std::memory_order_relaxed);
     ROS1_T srv;
     translate_2_to_1(*request, srv.request);
     if (client.call(srv)) {
       translate_1_to_2(srv.response, *response);
+      sdiag.ok.fetch_add(1, std::memory_order_relaxed);
     } else {
       throw std::runtime_error("Failed to get response from ROS 1 service " + client.getService());
     }
@@ -418,6 +561,8 @@ public:
     const ROS1Request & request1, ROS1Response & response1,
     int service_execution_timeout)
   {
+    auto & sdiag = ros1_bridge_diag::srv_counters_for("1to2", cli->get_service_name());
+    sdiag.calls.fetch_add(1, std::memory_order_relaxed);
     auto client = std::dynamic_pointer_cast<rclcpp::Client<ROS2_T>>(cli);
     if (!client) {
       RCLCPP_ERROR(logger, "Failed to get ROS 2 client %s", cli->get_service_name());
@@ -445,6 +590,7 @@ public:
         cli->get_service_name(), service_execution_timeout);
       return false;
     }
+    sdiag.ok.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
 
