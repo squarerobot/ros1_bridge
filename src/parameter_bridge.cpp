@@ -14,8 +14,10 @@
 
 #include <xmlrpcpp/XmlRpcException.h>
 
+#include <chrono>
 #include <list>
 #include <string>
+#include <thread>
 
 // include ROS 1
 #ifdef __clang__
@@ -239,6 +241,12 @@ int main(int argc, char * argv[])
   rclcpp::init(argc, argv);
   auto ros2_node = rclcpp::Node::make_shared("ros_bridge");
 
+  // Square Robot fix (service bridging): a separate ROS 2 node for the ROS 2 -> ROS 1
+  // service servers. forward_2_to_1() makes a blocking ROS 1 client.call(); hosting those
+  // servers on their own node + executor (below) keeps a slow/blocked service call from
+  // stalling topic relaying on the main node.
+  auto ros2_service_node = rclcpp::Node::make_shared("ros_bridge_services");
+
   std::list<ros1_bridge::BridgeHandles> all_handles;
   std::list<ros1_bridge::ServiceBridge1to2> service_bridges_1_to_2;
   std::list<ros1_bridge::ServiceBridge2to1> service_bridges_2_to_1;
@@ -417,7 +425,7 @@ int main(int argc, char * argv[])
       if (factory) {
         try {
           service_bridges_2_to_1.push_back(
-            factory->service_bridge_2_to_1(ros1_node, ros2_node, service_name));
+            factory->service_bridge_2_to_1(ros1_node, ros2_service_node, service_name));
           printf("Created 2 to 1 bridge for service %s\n", service_name.c_str());
         } catch (std::runtime_error & e) {
           fprintf(
@@ -441,14 +449,63 @@ int main(int argc, char * argv[])
   }
 
   // ROS 1 asynchronous spinner
-  ros::AsyncSpinner async_spinner(1);
+  //
+  // Square Robot fix (service bridging): use multiple ROS 1 spinner threads. A ROS 1
+  // service-server callback (forward_1_to_2) blocks its thread up to
+  // service_execution_timeout while waiting on the ROS 2 response; with a single spinner
+  // thread one in-flight bridged service call stalls ALL ROS 1 -> ROS 2 topic relays and
+  // other service calls. N threads decouple them.
+  unsigned int ros1_spinner_threads = std::thread::hardware_concurrency();
+  if (ros1_spinner_threads < 4) {ros1_spinner_threads = 4;}
+  ros::AsyncSpinner async_spinner(ros1_spinner_threads);
   async_spinner.start();
 
   // ROS 2 spinning loop
+  //
+  // Square Robot fix for non-deterministic bridge drops (utbot #3856):
+  //
+  // The upstream pattern was
+  //   rclcpp::executors::SingleThreadedExecutor executor;
+  //   while (ros1_node.ok() && rclcpp::ok()) {
+  //     executor.spin_node_once(ros2_node, std::chrono::milliseconds(1000));
+  //   }
+  // spin_node_once() does add_node() + spin_once() + remove_node() EVERY iteration:
+  // it executes exactly one ready callback, discards every other subscription that
+  // was ready in that same wait, and tears down + rebuilds the rmw waitset on every
+  // single callback. With ~57 ROS 2 -> ROS 1 subscriptions this (a) starves all but
+  // one subscription per wait, and (b) - because the waitset is attached/detached
+  // constantly - drops BEST_EFFORT KeepLast(1) data-available notifications for
+  // low-rate topics, which then relay their first sample and go permanently silent.
+  //
+  // Instead: add the node ONCE (the waitset is built a single time and its conditions
+  // stay attached), and let a dedicated thread run executor.spin(), which drains every
+  // ready subscription before re-waiting and blocks efficiently while idle (no
+  // busy-poll - this matters at high real-time-factor where CPU is contended). The
+  // main thread keeps the bridge's original ROS-1-liveness behaviour: when ros1_node
+  // or rclcpp goes down it cancels the executor so spin() returns and the process
+  // exits. spin() is deliberately NOT run on the main thread because it would block
+  // forever and never re-check ros1_node.ok().
   rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(ros2_node);
+  std::thread spin_thread([&executor]() {executor.spin();});
+
+  // Square Robot fix (service bridging): the ROS 2 -> ROS 1 service servers
+  // (forward_2_to_1, which block on a synchronous ROS 1 client.call()) live on a separate
+  // node + MultiThreadedExecutor so a blocked/slow service call can run concurrently and
+  // never stalls topic relaying on the main executor above.
+  rclcpp::executors::MultiThreadedExecutor service_executor;
+  service_executor.add_node(ros2_service_node);
+  std::thread service_spin_thread([&service_executor]() {service_executor.spin();});
+
   while (ros1_node.ok() && rclcpp::ok()) {
-    executor.spin_node_once(ros2_node, std::chrono::milliseconds(1000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
+  executor.cancel();
+  service_executor.cancel();
+  spin_thread.join();
+  service_spin_thread.join();
+  executor.remove_node(ros2_node);
+  service_executor.remove_node(ros2_service_node);
 
   return 0;
 }
