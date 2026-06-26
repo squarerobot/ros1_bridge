@@ -156,9 +156,14 @@ create_bidirectional_bridge(
   handles.bridge1to2 = create_bridge_from_1_to_2(
     ros1_node, ros2_node,
     ros1_type_name, topic_name, queue_size, ros2_type_name, topic_name, publisher_qos);
+  // Apply the configured QoS to the ROS 2->1 subscriber too, not just the 1->2 publisher.
+  // Otherwise the 2->1 subscriber falls back to the size_t overload's SensorDataQoS
+  // (best_effort/volatile) and silently drops latched (transient_local) ROS 2 topics: a
+  // one-shot latched publisher's sample is never delivered to the bridge, so it never
+  // reaches ROS 1.
   handles.bridge2to1 = create_bridge_from_2_to_1(
     ros2_node, ros1_node,
-    ros2_type_name, topic_name, queue_size, ros1_type_name, topic_name, queue_size,
+    ros2_type_name, topic_name, publisher_qos, ros1_type_name, topic_name, queue_size,
     handles.bridge1to2.ros2_publisher);
   return handles;
 }
