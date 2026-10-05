@@ -104,8 +104,13 @@ create_bridge_from_2_to_1(
   rclcpp::PublisherBase::SharedPtr ros2_pub)
 {
   auto factory = get_factory(ros1_type_name, ros2_type_name);
+  // A transient_local ROS 2 topic is latched on the ROS 1 side too, so a ROS 1 subscriber that
+  // connects later still gets the last sample, as it would from a latched ROS 1 publisher. The
+  // bridge's own ROS 1 subscriber drops it by callerid, so this cannot loop back to ROS 2.
+  const bool latch =
+    subscriber_qos.durability() == rclcpp::DurabilityPolicy::TransientLocal;
   auto ros1_pub = factory->create_ros1_publisher(
-    ros1_node, ros1_topic_name, publisher_queue_size);
+    ros1_node, ros1_topic_name, publisher_queue_size, latch);
 
   auto ros2_sub = factory->create_ros2_subscriber(
     ros2_node, ros2_topic_name, subscriber_qos, ros1_pub, ros2_pub);
